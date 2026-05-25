@@ -13,3 +13,13 @@ llvmUseGnuModeCompilers("x64")
 
 include("${CMAKE_CURRENT_LIST_DIR}/../cmake/win32.ensureNinjaPath.cmake")
 ensureNinjaPath()
+
+# Preset HOST_CXX_COMPILER to the LLVM clang++ resolved above.
+# cmake treats x86_64 (toolchain) != AMD64 (host) and sets CMAKE_CROSSCOMPILING=TRUE,
+# causing the cross-compilation branch of llama.cpp's UI cmake to run find_program for
+# a host compiler. Without this preset, find_program may pick up MinGW g++ from PATH,
+# which produces binaries that fail with 0xc0000139 when CUDA/Vulkan SDK DLLs shadow
+# newer MSVC runtime DLLs. Pinning to VS-bundled clang++ avoids the DLL conflict.
+if(DEFINED LLVM_ROOT AND NOT "${LLVM_ROOT}" STREQUAL "")
+    set(HOST_CXX_COMPILER "${LLVM_ROOT}/bin/clang++.exe" CACHE STRING "Host C++ compiler for cross-compilation helper tools" FORCE)
+endif()
