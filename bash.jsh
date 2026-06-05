@@ -1,6 +1,6 @@
 sudo apt update
 sudo apt install curl wget xz-utils
-
+ reg add "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\FileSystem" /v "LongPathsEnabled" /t REG_DWORD /d "1" /f
 export VULKAN_VERSION="$(curl -fsSL https://vulkan.lunarg.com/sdk/latest/linux.txt)"                                                                                      
 
 echo "Downloading Vulkan SDK version ${VULKAN_VERSION}"
