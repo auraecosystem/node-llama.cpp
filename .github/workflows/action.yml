@@ -1,0 +1,793 @@
+name: Build
+on:
+  push:
+    branches:
+      - main
+      - beta
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release_dry_run:
+        description: "Build only macOS arm64 and run release dry-run checks"
+        type: boolean
+        default: false
+      full_release:
+        description: "Run the full matrix and publish the selected branch to npm"
+        type: boolean
+        default: false
+      llama_cpp_release:
+        description: "Exact llama.cpp release tag to build, for example b8681. Leave empty to use the most recent shipped tag or latest."
+        type: string
+        default: ""
+      cuda_ext_publish_test:
+        description: "Download Linux/Windows CUDA fallback assets from an existing GitHub release and publish only the ext packages to the cuda-ext-test dist-tag"
+        type: boolean
+        default: false
+      cuda_ext_source_release_tag:
+        description: "GitHub release tag to source the ext assets from, for example realtimex-v0.2.4"
+        type: string
+        default: ""
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+
+jobs:
+  build:
+    if: github.event_name != 'workflow_dispatch' || inputs.cuda_ext_publish_test != true
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+      - name: Install modules
+        run: npm ci --ignore-scripts
+      - name: Build
+        run: npm run build
+      - name: Resolve llama.cpp release
+        id: resolveLlamaCppRelease
+        run: |
+          resolved_release='${{ github.event_name == 'workflow_dispatch' && inputs.llama_cpp_release || '' }}'
+          if [ -z "$resolved_release" ]; then
+            resolved_release="$(git log --format=%s --grep='^feat: ship llama.cpp ' -n 1 | sed 's/^feat: ship llama.cpp //')"
+          fi
+          if [ -z "$resolved_release" ]; then
+            resolved_release="latest"
+          fi
+          echo "Resolved llama.cpp release: $resolved_release"
+          echo "release=$resolved_release" >> "$GITHUB_OUTPUT"
+      - name: Download resolved llama.cpp release
+        env:
+          CI: true
+        run: node ./dist/cli/cli.js source download --release "${{ steps.resolveLlamaCppRelease.outputs.release }}" --skipBuild --noBundle --noUsageExample --updateBinariesReleaseMetadataAndSaveGitBundle
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v6
+        with:
+          include-hidden-files: true
+          name: "build"
+          path: "dist"
+      - name: Upload packed templates artifact
+        uses: actions/upload-artifact@v6
+        with:
+          include-hidden-files: true
+          name: "build-templates"
+          path: "templates/packed"
+      - name: Upload llama.cpp artifact
+        uses: actions/upload-artifact@v6
+        with:
+          include-hidden-files: true
+          name: "llama.cpp"
+          path: |
+            llama/binariesGithubRelease.json
+            llama/llama.cpp.info.json
+            llama/llama.cpp
+            llama/gitRelease.bundle
+  build-binaries:
+    if: github.event_name != 'workflow_dispatch' || inputs.cuda_ext_publish_test != true
+    name: Build binaries - ${{ matrix.config.name }}
+    needs:
+      - build
+    runs-on: ${{ matrix.config.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        config: ${{ fromJSON((github.event_name == 'workflow_dispatch' && inputs.release_dry_run == true) && '[{"name":"macOS arm64","os":"macos-26","artifact":"mac-arm64"}]' || '[{"name":"Windows (1)","os":"windows-2022","artifact":"win-1"},{"name":"Windows (2)","os":"windows-2022","artifact":"win-2"},{"name":"Ubuntu (1)","os":"ubuntu-22.04","artifact":"linux-1"},{"name":"Ubuntu (2)","os":"ubuntu-22.04","artifact":"linux-2"},{"name":"macOS x64","os":"macos-15-intel","artifact":"mac-x64"},{"name":"macOS arm64","os":"macos-26","artifact":"mac-arm64"}]') }}
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: build
+          path: dist
+
+      - name: Download llama.cpp artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: llama.cpp
+          path: llama
+
+      - name: Install dependencies on Windows
+        if: startsWith(matrix.config.os, 'windows')
+        run: |
+          choco install cmake.install --version=4.2.1
+          choco install cmake --version=4.2.1
+          choco install ninja
+      - name: Install dependencies on Ubuntu (1)
+        if: matrix.config.name == 'Ubuntu (1)'
+        run: |
+          sudo apt-get update
+          sudo apt-get install ninja-build libtbb-dev g++-aarch64-linux-gnu gcc-aarch64-linux-gnu g++-arm-linux-gnueabihf gcc-arm-linux-gnueabihf
+          wget -c https://github.com/Kitware/CMake/releases/download/v4.2.1/cmake-4.2.1-linux-x86_64.tar.gz
+          sudo tar --strip-components=1 -C /usr/local -xzf cmake-4.2.1-linux-x86_64.tar.gz
+          rm -f ./cmake-4.2.1-linux-x86_64.tar.gz
+          which aarch64-linux-gnu-gcc
+          which aarch64-linux-gnu-g++
+          which arm-linux-gnueabihf-gcc
+          which arm-linux-gnueabihf-g++
+          cmake --version
+      - name: Install dependencies on Ubuntu (2)
+        if: matrix.config.name == 'Ubuntu (2)'
+        run: |
+          sudo apt-get update
+          sudo apt-get install ninja-build libtbb-dev g++-aarch64-linux-gnu gcc-aarch64-linux-gnu
+          wget -c https://github.com/Kitware/CMake/releases/download/v4.2.1/cmake-4.2.1-linux-x86_64.tar.gz
+          sudo tar --strip-components=1 -C /usr/local -xzf cmake-4.2.1-linux-x86_64.tar.gz
+          rm -f ./cmake-4.2.1-linux-x86_64.tar.gz
+          cmake --version
+      - name: Install Cuda 13.1 on Windows (1)
+        if: matrix.config.name == 'Windows (1)'
+        uses: Jimver/cuda-toolkit@v0.2.30
+        with:
+          cuda: '13.1.0'
+          method: 'network'
+          use-local-cache: false
+
+      - name: Install Cuda 12.4 on Windows (2)
+        if: matrix.config.name == 'Windows (2)'
+        uses: Jimver/cuda-toolkit@v0.2.15
+        with:
+          cuda: '12.4.0'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust", "visual_studio_integration"]'
+          use-local-cache: false
+
+      - name: Install Cuda 13.1 on Ubuntu (1)
+        if: matrix.config.name == 'Ubuntu (1)'
+        uses: Jimver/cuda-toolkit@v0.2.30
+        with:
+          cuda: '13.1.0'
+          method: 'network'
+
+      - name: Install Cuda 12.4 on Ubuntu (2)
+        if: matrix.config.name == 'Ubuntu (2)'
+        uses: Jimver/cuda-toolkit@v0.2.15
+        with:
+          cuda: '12.4.0'
+          method: 'network'
+
+      - name: Install Vulkan SDK on Windows (1)
+        if: matrix.config.name == 'Windows (1)'
+        shell: powershell
+        env:
+          VULKAN_VERSION: 1.4.313.2
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          if ([string]::IsNullOrEmpty($env:CMAKE_PREFIX_PATH)) {
+            Add-Content $env:GITHUB_ENV "CMAKE_PREFIX_PATH=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          } else {
+            Add-Content $env:GITHUB_ENV "CMAKE_PREFIX_PATH=C:\VulkanSDK\${env:VULKAN_VERSION};$env:CMAKE_PREFIX_PATH"
+          }
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+      - name: Install Vulkan SDK on Ubuntu
+        if: matrix.config.name == 'Ubuntu (1)'
+        env:
+          VULKAN_VERSION: 1.4.341.1
+        run: |
+          sudo apt-get update
+          sudo apt-get install xz-utils
+          curl --no-progress-meter "https://sdk.lunarg.com/sdk/download/${VULKAN_VERSION}/linux/vulkan_sdk.tar.xz" -o "/opt/vulkan-sdk.tar.xz"
+          mkdir -p "/opt/vulkan-sdk"
+          tar -Jxf "/opt/vulkan-sdk.tar.xz" --strip-components=1 -C "/opt/vulkan-sdk"
+          rm -f "/opt/vulkan-sdk.tar.xz"
+          echo "VULKAN_SDK=/opt/vulkan-sdk/x86_64" >> $GITHUB_ENV
+          echo "/opt/vulkan-sdk/x86_64/bin" >> $GITHUB_PATH
+      - name: Install dependencies on macOS
+        if: matrix.config.name == 'macOS x64' || matrix.config.name == 'macOS arm64'
+        run: |
+          brew install cmake ninja
+          alias make=cmake
+          cmake --version
+          uname -mprs
+      - name: Setup & Build
+        id: build
+        shell: bash
+        timeout-minutes: 300
+        env:
+          ARTIFACT_NAME: ${{ matrix.config.artifact }}
+        run: |
+          npm ci --ignore-scripts
+          npx zx -y <<'EOF'
+          async function getLatestNodeVersions(maxDate) {
+            const res = await fetch("https://nodejs.org/dist/index.json");
+            const data = await res.json();
+            const versions = new Map();
+            let latestVersion = null;
+            for (const version of data) {
+              const majorVersion = Number(version.version.split(".")[0].slice("v".length));
+              const versionDate = new Date(version.date);
+              if (maxDate != null && versionDate.getTime() > maxDate)
+                continue;
+              if (!versions.has(majorVersion)) {
+                versions.set(majorVersion, version.version);
+              }
+              if (latestVersion === null || majorVersion > latestVersion) {
+                latestVersion = majorVersion;
+              }
+            }
+            return {versions, latestVersion};
+          }
+          const {versions: latestNodeVersions} = await getLatestNodeVersions(Date.now() - 1000 * 60 * 60 * 24 * 14);
+          const nodeVersion = latestNodeVersions.get(20);
+          const windowsOnArmNodeVersion = latestNodeVersions.get(20);
+          if (nodeVersion == null || windowsOnArmNodeVersion == null) {
+            throw new Error("Could not find node versions");
+          }
+          $.verbose = true;
+          await $`mkdir -p bins`;
+          async function buildBinary(arch, flags = [], nodeTarget = nodeVersion) {
+            console.log(`Building ${arch} for node ${nodeTarget} with flags`, flags);
+            await $`node ./dist/cli/cli.js source build --ciMode --noUsageExample --arch ${arch} --nodeTarget ${nodeTarget} ${flags}`;
+          }
+          const serverBuildCmakeOptions = {
+            LLAMA_BUILD_COMMON: "ON",
+            LLAMA_BUILD_EXAMPLES: "ON",
+            LLAMA_BUILD_SERVER: "ON",
+            LLAMA_BUILD_TESTS: "OFF",
+            LLAMA_BUILD_TOOLS: "ON",
+            LLAMA_CURL: "OFF",
+            LLAMA_HTTPLIB: "ON",
+            LLAMA_OPENSSL: "OFF",
+            LLAMA_BUILD_BORINGSSL: "OFF"
+          };
+          async function buildLlamaServerRuntimeBinary(arch, gpu, nodeTarget = nodeVersion) {
+            console.log(`Building managed llama-server runtime ${arch} for node ${nodeTarget} with gpu`, gpu);
+            const previousEnvValues = new Map();
+            for (const [optionName, optionValue] of Object.entries(serverBuildCmakeOptions)) {
+              const envName = `NODE_LLAMA_CPP_CMAKE_OPTION_${optionName}`;
+              previousEnvValues.set(envName, process.env[envName]);
+              process.env[envName] = optionValue;
+            }
+            try {
+              await buildBinary(arch, ["--gpu", gpu === false ? "false" : gpu], nodeTarget);
+            } finally {
+              for (const [envName, previousValue] of previousEnvValues) {
+                if (previousValue == null)
+                  delete process.env[envName];
+                else
+                  process.env[envName] = previousValue;
+              }
+            }
+          }
+          // build binaries
+          if (process.env.ARTIFACT_NAME === "win-1") {
+            await buildBinary("x64", ["--gpu", "false"]);
+            await buildBinary("x64", ["--gpu", "cuda"]);
+            await buildBinary("x64", ["--gpu", "vulkan"]);
+            await buildLlamaServerRuntimeBinary("x64", false);
+            await buildLlamaServerRuntimeBinary("x64", "cuda");
+            await buildLlamaServerRuntimeBinary("x64", "vulkan");
+          } else if (process.env.ARTIFACT_NAME === "win-2") {
+            await buildBinary("arm64", ["--gpu", "false"], windowsOnArmNodeVersion);
+            await buildBinary("x64", ["--gpu", "cuda"]);
+            await buildLlamaServerRuntimeBinary("arm64", false, windowsOnArmNodeVersion);
+          } else if (process.env.ARTIFACT_NAME === "linux-1") {
+            await buildBinary("x64", ["--gpu", "false"]);
+            await buildBinary("x64", ["--gpu", "cuda"]);
+            await buildBinary("x64", ["--gpu", "vulkan"]);
+            await buildBinary("arm64", ["--gpu", "false"]);
+            await buildBinary("armv7l", ["--gpu", "false"]);
+            await buildLlamaServerRuntimeBinary("x64", false);
+            await buildLlamaServerRuntimeBinary("x64", "vulkan");
+            await buildLlamaServerRuntimeBinary("arm64", false);
+            await buildLlamaServerRuntimeBinary("armv7l", false);
+          } else if (process.env.ARTIFACT_NAME === "linux-2") {
+            await buildBinary("x64", ["--gpu", "cuda"]);
+            await buildLlamaServerRuntimeBinary("x64", "cuda");
+          } else if (process.env.ARTIFACT_NAME === "mac-x64") {
+            await buildBinary("x64", ["--gpu", "metal"]);
+            await buildLlamaServerRuntimeBinary("x64", "metal");
+          } else if (process.env.ARTIFACT_NAME === "mac-arm64") {
+            await buildBinary("arm64", ["--gpu", "metal"]);
+            await buildLlamaServerRuntimeBinary("arm64", "metal");
+          }
+          // move binaries to bins
+          const localBuildsDirectoryPath = path.join(process.cwd(), "llama", "localBuilds");
+          const llamaBinsDirectoryPath = path.join(process.cwd(), "bins");
+          for (const folderName of await fs.readdir(localBuildsDirectoryPath)) {
+            await fs.move(
+              path.join(localBuildsDirectoryPath, folderName, "Release"),
+              path.join(llamaBinsDirectoryPath, folderName)
+            );
+          }
+          async function findLlamaServerRuntimeDir({arch, gpu}) {
+            for (const folderName of await fs.readdir(llamaBinsDirectoryPath)) {
+              const folderPath = path.join(llamaBinsDirectoryPath, folderName);
+              const metadataPath = path.join(folderPath, "_nlcBuildMetadata.json");
+              if (!(await fs.pathExists(path.join(folderPath, "llama-server"))) || !(await fs.pathExists(metadataPath)))
+                continue;
+              const metadata = await fs.readJson(metadataPath);
+              if (metadata?.buildOptions?.platform === "linux" && metadata?.buildOptions?.arch === arch && metadata?.buildOptions?.gpu === gpu)
+                return folderPath;
+            }
+            return null;
+          }
+          if (process.env.ARTIFACT_NAME === "win-2") {
+            await fs.move(
+              path.join(llamaBinsDirectoryPath, "win-x64-cuda"),
+              path.join(llamaBinsDirectoryPath, "win-x64-cuda-2")
+            );
+            if (!(await fs.pathExists(path.join(llamaBinsDirectoryPath, "win-x64-cuda-2", "ggml-cuda.dll")))) {
+              throw new Error("ggml-cuda.dll not found in win-x64-cuda-2");
+            }
+          } else if (process.env.ARTIFACT_NAME === "linux-2") {
+            await fs.move(
+              path.join(llamaBinsDirectoryPath, "linux-x64-cuda"),
+              path.join(llamaBinsDirectoryPath, "linux-x64-cuda-2")
+            );
+            if (!(await fs.pathExists(path.join(llamaBinsDirectoryPath, "linux-x64-cuda-2", "libggml-cuda.so")))) {
+              throw new Error("libggml-cuda.so not found in linux-x64-cuda-2");
+            }
+            const linuxX64CudaServerRuntimeDir = await findLlamaServerRuntimeDir({
+              arch: "x64",
+              gpu: "cuda"
+            });
+            if (linuxX64CudaServerRuntimeDir == null) {
+              throw new Error("linux x64 CUDA llama-server runtime not found");
+            }
+            if (!(await fs.pathExists(path.join(linuxX64CudaServerRuntimeDir, "libggml-cuda.so")))) {
+              throw new Error(`libggml-cuda.so not found in ${linuxX64CudaServerRuntimeDir}`);
+            }
+          }
+          await $`echo "Built binaries:"`;
+          await $`ls bins`;
+          EOF
+      - name: Split llama-server runtime artifact
+        shell: bash
+        run: |
+          mkdir -p llama-server-runtime-bins
+          find ./bins -mindepth 1 -maxdepth 1 -type d | while read dir; do
+            if [ -f "$dir/llama-server" ] || [ -f "$dir/llama-server.exe" ]; then
+              mv "$dir" ./llama-server-runtime-bins/
+            fi
+          done
+          echo "Llama server runtime binaries:"
+          ls ./llama-server-runtime-bins || true
+      - name: Publish artifact
+        uses: actions/upload-artifact@v6
+        with:
+          include-hidden-files: true
+          name: "bins-${{ matrix.config.artifact }}"
+          path: "bins/*"
+      - name: Publish llama-server runtime artifact
+        uses: actions/upload-artifact@v6
+        with:
+          include-hidden-files: true
+          if-no-files-found: ignore
+          name: "llama-server-runtime-${{ matrix.config.artifact }}"
+          path: "llama-server-runtime-bins/*"
+
+  build-dgx-spark-binaries:
+    if: |
+      github.event_name != 'pull_request' &&
+      (github.event_name != 'workflow_dispatch' || inputs.cuda_ext_publish_test != true) &&
+      (github.event_name != 'workflow_dispatch' || inputs.release_dry_run != true)
+    name: Build binaries - DGX Spark
+    needs:
+      - build
+    runs-on: [self-hosted, Linux, ARM64, dgx-spark, cuda]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: build
+          path: dist
+
+      - name: Download llama.cpp artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: llama.cpp
+          path: llama
+
+      - name: Configure DGX Spark CUDA environment
+        shell: bash
+        run: |
+          echo "CUDA_HOME=/usr/local/cuda" >> "$GITHUB_ENV"
+          echo "CUDA_PATH=/usr/local/cuda" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
+          uname -mprs
+          nvidia-smi
+          /usr/local/cuda/bin/nvcc --version
+          cmake --version
+          ninja --version
+      - name: Setup & Build
+        id: build
+        shell: bash
+        timeout-minutes: 300
+        env:
+          ARTIFACT_NAME: linux-arm64-cuda
+        run: |
+          npm ci --ignore-scripts
+          npx zx -y <<'EOF'
+          async function getLatestNodeVersions(maxDate) {
+            const res = await fetch("https://nodejs.org/dist/index.json");
+            const data = await res.json();
+            const versions = new Map();
+            let latestVersion = null;
+            for (const version of data) {
+              const majorVersion = Number(version.version.split(".")[0].slice("v".length));
+              const versionDate = new Date(version.date);
+              if (maxDate != null && versionDate.getTime() > maxDate)
+                continue;
+              if (!versions.has(majorVersion)) {
+                versions.set(majorVersion, version.version);
+              }
+              if (latestVersion === null || majorVersion > latestVersion) {
+                latestVersion = majorVersion;
+              }
+            }
+            return {versions, latestVersion};
+          }
+          const {versions: latestNodeVersions} = await getLatestNodeVersions(Date.now() - 1000 * 60 * 60 * 24 * 14);
+          const nodeVersion = latestNodeVersions.get(20);
+          if (nodeVersion == null) {
+            throw new Error("Could not find node 20 version");
+          }
+          $.verbose = true;
+          await $`mkdir -p bins`;
+          async function buildBinary(arch, flags = [], nodeTarget = nodeVersion) {
+            console.log(`Building ${arch} for node ${nodeTarget} with flags`, flags);
+            await $`node ./dist/cli/cli.js source build --ciMode --noUsageExample --arch ${arch} --nodeTarget ${nodeTarget} ${flags}`;
+          }
+          const serverBuildCmakeOptions = {
+            LLAMA_BUILD_COMMON: "ON",
+            LLAMA_BUILD_EXAMPLES: "ON",
+            LLAMA_BUILD_SERVER: "ON",
+            LLAMA_BUILD_TESTS: "OFF",
+            LLAMA_BUILD_TOOLS: "ON",
+            LLAMA_CURL: "OFF",
+            LLAMA_HTTPLIB: "ON",
+            LLAMA_OPENSSL: "OFF",
+            LLAMA_BUILD_BORINGSSL: "OFF"
+          };
+          async function buildLlamaServerRuntimeBinary(arch, gpu, nodeTarget = nodeVersion) {
+            console.log(`Building managed llama-server runtime ${arch} for node ${nodeTarget} with gpu`, gpu);
+            const previousEnvValues = new Map();
+            for (const [optionName, optionValue] of Object.entries(serverBuildCmakeOptions)) {
+              const envName = `NODE_LLAMA_CPP_CMAKE_OPTION_${optionName}`;
+              previousEnvValues.set(envName, process.env[envName]);
+              process.env[envName] = optionValue;
+            }
+            try {
+              await buildBinary(arch, ["--gpu", gpu === false ? "false" : gpu], nodeTarget);
+            } finally {
+              for (const [envName, previousValue] of previousEnvValues) {
+                if (previousValue == null)
+                  delete process.env[envName];
+                else
+                  process.env[envName] = previousValue;
+              }
+            }
+          }
+          await buildLlamaServerRuntimeBinary("arm64", "cuda");
+          const localBuildsDirectoryPath = path.join(process.cwd(), "llama", "localBuilds");
+          const llamaBinsDirectoryPath = path.join(process.cwd(), "bins");
+          for (const folderName of await fs.readdir(localBuildsDirectoryPath)) {
+            await fs.move(
+              path.join(localBuildsDirectoryPath, folderName, "Release"),
+              path.join(llamaBinsDirectoryPath, folderName)
+            );
+          }
+          async function findLlamaServerRuntimeDir({arch, gpu}) {
+            for (const folderName of await fs.readdir(llamaBinsDirectoryPath)) {
+              const folderPath = path.join(llamaBinsDirectoryPath, folderName);
+              const metadataPath = path.join(folderPath, "_nlcBuildMetadata.json");
+              if (!(await fs.pathExists(path.join(folderPath, "llama-server"))) || !(await fs.pathExists(metadataPath)))
+                continue;
+              const metadata = await fs.readJson(metadataPath);
+              if (metadata?.buildOptions?.platform === "linux" && metadata?.buildOptions?.arch === arch && metadata?.buildOptions?.gpu === gpu)
+                return folderPath;
+            }
+            return null;
+          }
+          const linuxArm64CudaServerRuntimeDir = await findLlamaServerRuntimeDir({
+            arch: "arm64",
+            gpu: "cuda"
+          });
+          if (linuxArm64CudaServerRuntimeDir == null) {
+            throw new Error("linux arm64 CUDA llama-server runtime not found");
+          }
+          if (!(await fs.pathExists(path.join(linuxArm64CudaServerRuntimeDir, "libggml-cuda.so")))) {
+            throw new Error(`libggml-cuda.so not found in ${linuxArm64CudaServerRuntimeDir}`);
+          }
+          await $`echo "Built DGX Spark binaries:"`;
+          await $`ls bins`;
+          EOF
+      - name: Split llama-server runtime artifact
+        shell: bash
+        run: |
+          mkdir -p llama-server-runtime-bins
+          find ./bins -mindepth 1 -maxdepth 1 -type d | while read dir; do
+            if [ -f "$dir/llama-server" ]; then
+              mv "$dir" ./llama-server-runtime-bins/
+            fi
+          done
+          echo "DGX Spark llama-server runtime binaries:"
+          ls ./llama-server-runtime-bins || true
+      - name: Publish artifact
+        uses: actions/upload-artifact@v6
+        with:
+          include-hidden-files: true
+          if-no-files-found: ignore
+          name: "bins-linux-arm64-cuda"
+          path: "bins/*"
+
+      - name: Publish llama-server runtime artifact
+        uses: actions/upload-artifact@v6
+        with:
+          include-hidden-files: true
+          name: "llama-server-runtime-linux-arm64-cuda"
+          path: "llama-server-runtime-bins/*"
+
+  release-dry-run:
+    name: Release dry run
+    if: github.event_name == 'workflow_dispatch' && inputs.release_dry_run == true
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+      issues: write
+      pull-requests: write
+      discussions: write
+    needs:
+      - build
+      - build-binaries
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref }}
+          lfs: true
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+      - name: Install modules
+        run: npm ci --ignore-scripts
+      - uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+      - name: Move smoke artifacts
+        run: |
+          mkdir -p bins
+          mkdir -p llama-server-runtime-bins
+          mv artifacts/bins-*/* bins/
+          for dir in artifacts/llama-server-runtime-*; do
+            [ -d "$dir" ] || continue
+            mv "$dir"/* llama-server-runtime-bins/
+          done
+          mv artifacts/build dist/
+          cp -r artifacts/llama.cpp/llama.cpp/grammars llama/grammars
+          rm -f ./llama/binariesGithubRelease.json
+          mv artifacts/llama.cpp/binariesGithubRelease.json ./llama/binariesGithubRelease.json
+          rm -f ./llama/llama.cpp.info.json
+          mv artifacts/llama.cpp/llama.cpp.info.json ./llama/llama.cpp.info.json
+          rm -f ./llama/gitRelease.bundle
+          mv artifacts/llama.cpp/gitRelease.bundle ./llama/gitRelease.bundle
+          mv artifacts/build-templates templates/packed/
+          rm -f ./templates/package.json
+          rm -f ./templates/package-lock.json
+          echo "Built smoke binaries:"
+          ls bins
+          echo "Built smoke llama-server runtimes:"
+          ls llama-server-runtime-bins || true
+      - name: Add "postinstall" script to package.json
+        run: npm run addPostinstallScript
+      - name: Prepare GitHub release assets
+        run: npx --no vite-node ./scripts/prepareGithubReleaseAssets.ts
+      - name: Validate npm package
+        run: npm publish --dry-run
+      - name: Smoke semantic-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_RELEASE_REF: ${{ github.ref }}
+          DEBUG: "semantic-release:*"
+        run: |
+          git apply --ignore-whitespace ./scripts/patches/@semantic-release+github+11.0.0.patch
+          npx semantic-release --dry-run
+  cuda-ext-publish-test:
+    name: CUDA ext publish test
+    if: github.event_name == 'workflow_dispatch' && inputs.cuda_ext_publish_test == true && inputs.cuda_ext_source_release_tag != ''
+    runs-on: ubuntu-latest
+    environment:
+      name: npm
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref }}
+          lfs: true
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+      - name: Install modules
+        run: npm ci --ignore-scripts
+      - name: Download CUDA ext release assets
+        run: npx --no vite-node ./scripts/downloadPrebuiltBinariesGithubReleaseAssets.ts --releaseTag "${{ inputs.cuda_ext_source_release_tag }}"
+      - name: Inspect downloaded CUDA ext assets
+        run: |
+          echo "Prepared CUDA ext test bins:"
+          find bins -maxdepth 3 -type f | sort
+      - name: Move binaries to standalone prebuilt binary modules
+        run: npx --no vite-node ./scripts/movePrebuiltBinariesToStandaloneModules.ts
+      - name: Prepare standalone CUDA ext packages
+        env:
+          STANDALONE_PACKAGES: "node-llama-cpp-linux-x64-cuda-ext,node-llama-cpp-win-x64-cuda-ext"
+        run: npx --no vite-node ./scripts/prepareStandalonePrebuiltBinaryModules.ts
+      - name: Chunk standalone CUDA ext packages
+        env:
+          STANDALONE_PACKAGES: "node-llama-cpp-linux-x64-cuda-ext,node-llama-cpp-win-x64-cuda-ext"
+        run: npx --no vite-node ./scripts/prepareStandaloneCudaExtChunkPackages.ts --packageVersion "0.0.0-cuda-ext-test.${{ github.run_number }}.${{ github.run_attempt }}"
+      - name: Inspect CUDA ext tarballs
+        run: |
+          for package in \
+            node-llama-cpp-linux-x64-cuda-ext-chunk-01 \
+            node-llama-cpp-linux-x64-cuda-ext \
+            node-llama-cpp-win-x64-cuda-ext-chunk-01 \
+            node-llama-cpp-win-x64-cuda-ext; do
+            cd "./packages/@realtimex/$package"
+            echo "Packing @realtimex/$package"
+            npm pack --json
+            rm -f ./*.tgz
+            cd -
+          done
+      - name: Publish CUDA ext test packages
+        env:
+          GH_RELEASE_REF: ${{ github.ref }}
+          ALLOW_SKIPPED_PACKAGES: "true"
+          STANDALONE_PACKAGES: "node-llama-cpp-linux-x64-cuda-ext,node-llama-cpp-win-x64-cuda-ext"
+          STANDALONE_DIST_TAG: "cuda-ext-test"
+        run: npx --no vite-node ./scripts/publishStandalonePrebuiltBinaryModules.ts --packageVersion "0.0.0-cuda-ext-test.${{ github.run_number }}.${{ github.run_attempt }}"
+
+  release:
+    name: Release
+    if: |
+      (github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/beta')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.full_release == true && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/beta'))
+    runs-on: ubuntu-latest
+    concurrency: release-${{ github.ref }}
+    environment:
+      name: npm
+      url: ${{ steps.set-npm-url.outputs.npm-url }}
+    permissions:
+      id-token: write
+      contents: write
+      issues: write
+      pull-requests: write
+      discussions: write
+    needs:
+      - build
+      - build-binaries
+      - build-dgx-spark-binaries
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref }}
+          lfs: true
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+      - name: Install modules
+        run: npm ci --ignore-scripts
+      - uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+      - name: Move artifacts
+        run: |
+          mkdir -p bins
+          mkdir -p llama-server-runtime-bins
+          mv artifacts/bins-*/* bins/
+          for dir in artifacts/llama-server-runtime-*; do
+            [ -d "$dir" ] || continue
+            mv "$dir"/* llama-server-runtime-bins/
+          done
+          mv artifacts/build dist/
+          if [ -d ./bins/win-x64-cuda-2 ]; then
+            mkdir -p ./bins/win-x64-cuda/fallback
+            mv ./bins/win-x64-cuda-2/ggml-cuda.dll ./bins/win-x64-cuda/fallback/ggml-cuda.dll
+            rm -rf ./bins/win-x64-cuda-2
+          fi
+          if [ -d ./bins/linux-x64-cuda-2 ]; then
+            mkdir -p ./bins/linux-x64-cuda/fallback
+            mv ./bins/linux-x64-cuda-2/libggml-cuda.so ./bins/linux-x64-cuda/fallback/libggml-cuda.so
+            rm -rf ./bins/linux-x64-cuda-2
+          fi
+          cp -r artifacts/llama.cpp/llama.cpp/grammars llama/grammars
+          rm -f ./llama/binariesGithubRelease.json
+          mv artifacts/llama.cpp/binariesGithubRelease.json ./llama/binariesGithubRelease.json
+          rm -f ./llama/llama.cpp.info.json
+          mv artifacts/llama.cpp/llama.cpp.info.json ./llama/llama.cpp.info.json
+          rm -f ./llama/gitRelease.bundle
+          mv artifacts/llama.cpp/gitRelease.bundle ./llama/gitRelease.bundle
+          mv artifacts/build-templates templates/packed/
+          rm -f ./templates/package.json
+          rm -f ./templates/package-lock.json
+          echo "Built binaries:"
+          ls bins
+          echo "Built llama-server runtimes:"
+          ls llama-server-runtime-bins || true
+      - name: Prepare GitHub release assets
+        env:
+          REQUIRE_ALL_LLAMA_SERVER_RELEASE_ASSETS: "true"
+        run: npx --no vite-node ./scripts/prepareGithubReleaseAssets.ts
+      - name: Move binaries to standalone prebuilt binary modules
+        run: npx --no vite-node ./scripts/movePrebuiltBinariesToStandaloneModules.ts
+      - name: Prepare standalone prebuilt binary modules
+        run: npx --no vite-node ./scripts/prepareStandalonePrebuiltBinaryModules.ts
+      - name: Chunk standalone CUDA ext packages
+        run: npx --no vite-node ./scripts/prepareStandaloneCudaExtChunkPackages.ts --packageVersion "$(node -p "require('./package.json').version")"
+      - name: Add "postinstall" script to package.json
+        run: npm run addPostinstallScript
+      - name: Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_RELEASE_REF: ${{ github.ref }}
+          DEBUG: "semantic-release:*"
+        run: |
+          git apply --ignore-whitespace ./scripts/patches/@semantic-release+github+11.0.0.patch
+          npx semantic-release
+      - name: Set npm package url to GITHUB_OUTPUT
+        id: set-npm-url
+        run: |
+          if [ -f .semanticRelease.npmPackage.deployedVersion.txt ]; then
+            echo "npm-url=https://www.npmjs.com/package/@realtimex/node-llama-cpp/v/$(cat .semanticRelease.npmPackage.deployedVersion.txt)" >> $GITHUB_OUTPUT
+          fi
+      - name: Publish node-llama-latest-release.json to realtimex resources
+        if: hashFiles('.semanticRelease.npmPackage.deployedVersion.txt') != ''
+        env:
+          GH_TOKEN: ${{ secrets.REALTIMEX_RELEASES_TOKEN }}
+        run: |
+          version=$(cat .semanticRelease.npmPackage.deployedVersion.txt)
+          tag="realtimex-v${version}"
+          # Fetch llama-server assets from the newly published release
+          assets_json=$(gh release view "$tag" \
+            --repo therealtimex/node-llama-cpp \
+            --json assets \
+            --jq '.assets | map(select(.name | startswith("llama-server-"))) | map({name: .name, size: .size, browser_download_url: .url, created_at: .createdAt, updated_at: .updatedAt})')
+          printf '{"tag":"%s","assets":%s}\n' "$tag" "$assets_json" > node-llama-latest-release.json
+          gh release upload resources node-llama-latest-release.json \
+            --repo therealtimex/realtimex \
+            --clobber
