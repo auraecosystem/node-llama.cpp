@@ -1,1 +1,8 @@
 
+{
+  "mcpServers": {
+    "workos": {
+      "serverUrl": "https://mcp.workos.com/mcp"
+    }
+  }
+}
