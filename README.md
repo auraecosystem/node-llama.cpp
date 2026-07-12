@@ -17,7 +17,7 @@
 
 ✨ [`gpt-oss` is here!](https://node-llama-cpp.withcat.ai/blog/v3.12-gpt-oss) ✨
 
-## Features
+> ## Features
 * Run LLMs locally on your machine
 * [Metal, CUDA and Vulkan support](https://node-llama-cpp.withcat.ai/guide/#gpu-support)
 * [Pre-built binaries are provided](https://node-llama-cpp.withcat.ai/guide/building-from-source), with a fallback to building from source _**without**_ `node-gyp` or Python
@@ -41,7 +41,7 @@
 
 ## Try It Without Installing
 Chat with a model in your terminal using [a single command](https://node-llama-cpp.withcat.ai/cli/chat):
-```bash
+```bash.zsh
 npx -y @realtimex/node-llama-cpp chat
 ```
 
@@ -56,7 +56,7 @@ On `linux-x64` and `win-x64` with CUDA, the large fallback CUDA backend may be d
 If pre-built binaries are not available for your platform, or the downloaded CUDA fallback backend still does not work with your machine, it'll fallback to download a release of `llama.cpp` and build it from source with `cmake`.
 To disable this behavior, set the environment variable `NODE_LLAMA_CPP_SKIP_DOWNLOAD` to `true`.
 
-## Usage
+> ## Usage
 ```typescript
 import {fileURLToPath} from "url";
 import path from "path";
@@ -93,7 +93,7 @@ console.log("AI: " + a2);
 ## Contributing
 To contribute to `node-llama-cpp` read the [contribution guide](https://node-llama-cpp.withcat.ai/guide/contributing).
 
-## Acknowledgements
+> ## Acknowledgements
 * llama.cpp: [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)
 
 
